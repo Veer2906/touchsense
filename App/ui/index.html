@@ -1,0 +1,429 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: #0c0c0c; color: #cfcfcf;
+    font: 12px/1.4 ui-monospace, Menlo, monospace; -webkit-user-select: none; cursor: default;
+  }
+  canvas { display: block; }
+  #main { display: flex; flex-direction: column; height: 100%; box-sizing: border-box; padding: 16px; gap: 12px; }
+  #stage { flex: 1 1 0; min-height: 0; display: flex; gap: 12px; }
+  #screenPane, #cameraPane { min-width: 0; display: flex; align-items: center; justify-content: center; }
+  #screenPane { flex: 3 1 0; }
+  #cameraPane { flex: 2 1 0; }
+  #wave { flex: none; width: 100%; height: 120px; }
+  #bar { flex: none; display: flex; align-items: center; gap: 14px; height: 22px; white-space: nowrap; }
+  #lamp { flex: none; width: 9px; height: 9px; border-radius: 50%; border: 1px solid #666; }
+  #lamp.on { background: #fff; border-color: #fff; }
+  #last { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  #info { margin-left: auto; color: #777; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  button { all: unset; flex: none; padding: 2px 10px; border: 1px solid #444; color: #cfcfcf; }
+  button:hover { border-color: #999; }
+  button:active { background: #222; }
+  button.on { background: #cfcfcf; color: #0c0c0c; border-color: #cfcfcf; }
+  #overlay { position: fixed; inset: 0; background: #0c0c0c; }
+  #prompt { position: absolute; left: 0; right: 0; top: 46%; text-align: center; font-size: 14px; pointer-events: none; }
+  #note { position: absolute; left: 0; right: 0; top: calc(46% + 28px); text-align: center; color: #888; pointer-events: none; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div id="main">
+  <div id="stage">
+    <div id="screenPane"><canvas id="screen"></canvas></div>
+    <div id="cameraPane"><canvas id="camera"></canvas></div>
+  </div>
+  <canvas id="wave"></canvas>
+  <div id="bar">
+    <span id="lamp"></span><span id="last">starting</span>
+    <span id="info"></span>
+    <button id="calibrate" hidden>calibrate</button>
+    <button id="clear" hidden>clear</button>
+    <button id="clicks" hidden>clicks off</button>
+  </div>
+</div>
+<div id="overlay" hidden>
+  <canvas id="targets"></canvas>
+  <div id="prompt"></div>
+  <div id="note"></div>
+</div>
+<script>
+const post = cmd => window.webkit?.messageHandlers?.app?.postMessage({ cmd });
+const el = id => document.getElementById(id);
+const percent = value => Math.round(value * 100) + '%';
+const BONES = [[0, 1, 2, 3, 4], [0, 5, 6, 7, 8], [0, 9, 10, 11, 12], [0, 13, 14, 15, 16], [0, 17, 18, 19, 20]];
+
+const COLUMNS = 2000;
+const wave = {
+  low: new Float32Array(COLUMNS), high: new Float32Array(COLUMNS),
+  detection: new Float32Array(COLUMNS), head: 0, threshold: 6,
+};
+const marks = [];
+const taps = [];
+let status = { camera: 'starting' };
+let clicks = false;
+let hands = [];
+let handsAt = 0;
+let preview = null;
+let calibration = null;
+let litUntil = 0;
+let closeTimer = 0;
+let scrolling = null;
+let accepted = null;
+
+function recv(message) {
+  if (message.type === 'wave') onWave(message);
+  else if (message.type === 'hands') { hands = message.hands; handsAt = performance.now(); }
+  else if (message.type === 'preview') onPreview(message);
+  else if (message.type === 'event') onEvent(message);
+  else if (message.type === 'status') onStatus(message);
+  else if (message.type === 'clicks') onClicks(message);
+  else if (message.type === 'notice') el('last').textContent = message.text;
+  else if (message.type === 'scroll') {
+    scrolling = { x: message.x, y: message.y, at: performance.now() };
+    el('last').textContent = 'scrolling';
+  }
+  else if (message.type === 'calibration') onCalibration(message);
+}
+
+function onWave(message) {
+  for (let i = 0; i < message.low.length; i++) {
+    const slot = (message.column + i) % COLUMNS;
+    wave.low[slot] = message.low[i];
+    wave.high[slot] = message.high[i];
+    wave.detection[slot] = message.detection[i];
+  }
+  wave.head = message.column + message.low.length;
+  wave.threshold = message.threshold;
+}
+
+function onPreview(message) {
+  const image = new Image();
+  image.onload = () => { preview = image; };
+  image.src = 'data:image/jpeg;base64,' + message.jpeg;
+}
+
+function onEvent(message) {
+  marks.push({ column: message.column, tap: message.tap });
+  while (marks.length && marks[0].column < wave.head - COLUMNS) marks.shift();
+  const level = message.snr.toFixed(0) + ' dB';
+  if (!message.tap) {
+    el('last').textContent = `ignored · ${message.why} · ${level}`;
+    return;
+  }
+  litUntil = performance.now() + 220;
+  if (message.x == null) {
+    el('last').textContent = `tap · ${level}`;
+    return;
+  }
+  taps.push({ at: performance.now(), x: message.x, y: message.y });
+  if (taps.length > 8) taps.shift();
+  el('last').textContent = `${clicks ? 'click' : 'tap'} · ${percent(message.x)} across, ${percent(message.y)} down · ${level}`;
+}
+
+function onStatus(message) {
+  if (message.mic !== 'ok' && message.mic !== 'starting') {
+    el('last').textContent = {
+      denied: 'microphone access denied. allow it in System Settings › Privacy & Security › Microphone, then reopen',
+      missing: 'no microphone found',
+      failed: 'could not open the microphone',
+    }[message.mic] || message.mic;
+    return;
+  }
+  status = message;
+  if (el('last').textContent === 'starting' && message.mic === 'ok') el('last').textContent = 'listening';
+  const live = message.camera === 'ok';
+  el('calibrate').hidden = !live;
+  el('clear').hidden = !message.pointer;
+  el('clicks').hidden = !message.pointer;
+  const parts = [];
+  if (live) parts.push(`${message.cameraName} · ${message.fps} fps`);
+  if (message.pointer) {
+    parts.push(`mapping ±${message.pointer.millimetres.toFixed(1)} mm · lag ${Math.round(message.pointer.lag * 1000)} ms`);
+    parts.push(message.screenCheck ? 'on-screen hands filtered' : 'on-screen hands not filtered (no screen recording access)');
+  } else if (live) {
+    parts.push('not calibrated: press calibrate');
+  }
+  el('info').textContent = parts.join(' · ');
+}
+
+function onClicks(message) {
+  clicks = message.state === 'on';
+  el('clicks').textContent = { on: 'clicks on', off: 'clicks off', blocked: 'clicks need permission' }[message.state];
+  el('clicks').className = clicks ? 'on' : '';
+  if (message.state === 'blocked') {
+    el('last').textContent = 'to click anywhere: turn this app on in System Settings › Privacy & Security › Accessibility (press the button to open it)';
+  }
+}
+
+function onCalibration(message) {
+  clearTimeout(closeTimer);
+  if (message.phase === 'cancelled') return closeCalibration();
+  if (calibration?.phase === 'taps' && (message.done ?? calibration.total) > calibration.done) {
+    accepted = { x: calibration.x, y: calibration.y, at: performance.now() };
+  }
+  calibration = message;
+  el('overlay').hidden = false;
+  el('note').textContent = message.note || '';
+  if (message.phase === 'taps') {
+    el('prompt').textContent = `${message.heard ? 'tap heard' : 'touch the circle with your index fingertip'} · ${message.done} / ${message.total} · esc cancels`;
+  } else if (message.phase === 'done') {
+    el('prompt').textContent = `mapping error ${message.millimetres.toFixed(1)} mm (median, held-out) · camera lag ${Math.round(message.lag * 1000)} ms`;
+    closeTimer = setTimeout(closeCalibration, 3500);
+  } else {
+    el('prompt').textContent = `calibration failed: ${message.problem}`;
+    closeTimer = setTimeout(closeCalibration, 4500);
+  }
+}
+
+function closeCalibration() {
+  calibration = null;
+  accepted = null;
+  el('overlay').hidden = true;
+  post('closed');
+}
+
+function fit(canvas, width, height) {
+  const ratio = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(width * ratio)), h = Math.max(1, Math.round(height * ratio));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+    canvas.style.width = width + 'px';
+    canvas.style.height = height + 'px';
+  }
+  const context = canvas.getContext('2d');
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  context.clearRect(0, 0, width, height);
+  return context;
+}
+
+function contain(pane, aspect) {
+  let width = pane.clientWidth, height = width / aspect;
+  if (height > pane.clientHeight) {
+    height = pane.clientHeight;
+    width = height * aspect;
+  }
+  return [Math.floor(width), Math.floor(height)];
+}
+
+function liveHands(now) {
+  return now - handsAt < 300 ? hands : [];
+}
+
+function drawScreen(now) {
+  const [width, height] = contain(el('screenPane'), screen.width / screen.height);
+  const context = fit(el('screen'), width, height);
+
+  for (const hand of liveHands(now)) {
+    if (hand.displayed || !hand.screen) continue;
+    const [x, y] = hand.screen;
+    if (x < 0 || x > 1 || y < 0 || y > 1) continue;
+    context.strokeStyle = '#8a8a8a';
+    context.lineWidth = 1;
+    context.beginPath();
+    context.arc(x * width, y * height, 7, 0, 2 * Math.PI);
+    context.stroke();
+  }
+
+  if (scrolling && now - scrolling.at < 150) {
+    context.fillStyle = '#fff';
+    for (const side of [-7, 7]) {
+      context.beginPath();
+      context.arc(scrolling.x * width + side, scrolling.y * height, 5, 0, 2 * Math.PI);
+      context.fill();
+    }
+  }
+
+  for (const tap of taps) {
+    const age = now - tap.at;
+    const x = tap.x * width, y = tap.y * height;
+    context.fillStyle = `rgba(255,255,255,${Math.max(0, 1 - age / 8000)})`;
+    context.beginPath();
+    context.arc(x, y, 5, 0, 2 * Math.PI);
+    context.fill();
+    if (age < 450) {
+      context.strokeStyle = `rgba(255,255,255,${1 - age / 450})`;
+      context.lineWidth = 1.5;
+      context.beginPath();
+      context.arc(x, y, 5 + 34 * age / 450, 0, 2 * Math.PI);
+      context.stroke();
+    }
+  }
+
+  const lit = now < litUntil;
+  context.strokeStyle = lit ? '#fff' : '#4a4a4a';
+  context.lineWidth = lit ? 3 : 1;
+  context.strokeRect(0.5, 0.5, width - 1, height - 1);
+  el('lamp').className = lit ? 'on' : '';
+}
+
+function drawCamera(now) {
+  const aspect = preview ? preview.naturalWidth / preview.naturalHeight : 16 / 9;
+  const [width, height] = contain(el('cameraPane'), aspect);
+  const context = fit(el('camera'), width, height);
+  const live = status.camera === 'ok';
+
+  if (live && preview) {
+    context.globalAlpha = 0.8;
+    context.drawImage(preview, 0, 0, width, height);
+    context.globalAlpha = 1;
+  } else {
+    const lines = {
+      starting: ['starting camera'],
+      denied: ['camera access denied', 'allow it in System Settings › Privacy & Security › Camera, then reopen'],
+      missing: ['iPhone camera not found', 'mount the phone, lock it, and point its back cameras at this screen'],
+    }[status.camera] || ['waiting for camera'];
+    context.fillStyle = '#777';
+    context.font = '12px ui-monospace, Menlo, monospace';
+    context.textAlign = 'center';
+    lines.forEach((line, i) => context.fillText(line, width / 2, height / 2 + (i - (lines.length - 1) / 2) * 18, width - 16));
+  }
+
+  if (live && status.pointer) {
+    context.strokeStyle = 'rgba(255,255,255,0.55)';
+    context.lineWidth = 1;
+    context.setLineDash([4, 4]);
+    context.beginPath();
+    status.pointer.quad.forEach(([x, y], i) => context[i ? 'lineTo' : 'moveTo'](x * width, y * height));
+    context.closePath();
+    context.stroke();
+    context.setLineDash([]);
+  }
+
+  if (live) {
+    for (const hand of liveHands(now)) {
+      const point = i => [hand.joints[2 * i] * width, hand.joints[2 * i + 1] * height];
+      const sure = i => hand.confidences[i] >= 0.3;
+      context.strokeStyle = hand.displayed ? '#666' : '#fff';
+      context.lineWidth = 1.5;
+      context.beginPath();
+      for (const bone of BONES) {
+        for (let i = 1; i < bone.length; i++) {
+          if (!sure(bone[i - 1]) || !sure(bone[i])) continue;
+          context.moveTo(...point(bone[i - 1]));
+          context.lineTo(...point(bone[i]));
+        }
+      }
+      context.stroke();
+      if (hand.displayed || !sure(8)) continue;
+      const [x, y] = point(8);
+      context.beginPath();
+      context.arc(x, y, 6, 0, 2 * Math.PI);
+      context.stroke();
+    }
+  }
+
+  context.strokeStyle = '#4a4a4a';
+  context.lineWidth = 1;
+  context.strokeRect(0.5, 0.5, width - 1, height - 1);
+}
+
+function level(value) {
+  return value <= 0 ? 0 : Math.min(1, Math.max(0, (20 * Math.log10(value) + 84) / 84));
+}
+
+function drawWave() {
+  const canvas = el('wave');
+  const width = canvas.clientWidth, height = canvas.clientHeight;
+  const context = fit(canvas, width, height);
+  const top = height * 0.66, middle = top / 2, strip = height - top - 8, start = wave.head - COLUMNS;
+
+  for (let x = 0; x < width; x++) {
+    const from = start + Math.floor(x * COLUMNS / width);
+    const to = Math.max(from + 1, start + Math.floor((x + 1) * COLUMNS / width));
+    let low = 0, high = 0, detection = 0;
+    for (let column = Math.max(from, 0); column < to; column++) {
+      const slot = column % COLUMNS;
+      low = Math.min(low, wave.low[slot]);
+      high = Math.max(high, wave.high[slot]);
+      detection = Math.max(detection, wave.detection[slot]);
+    }
+    const up = level(high) * middle, down = level(-low) * middle;
+    context.fillStyle = '#bdbdbd';
+    context.fillRect(x, middle - up, 1, Math.max(1, up + down));
+    const bar = Math.min(1, detection / 40) * strip;
+    context.fillStyle = detection >= wave.threshold ? '#fff' : '#555';
+    context.fillRect(x, height - bar, 1, Math.max(1, bar));
+  }
+
+  context.strokeStyle = '#3a3a3a';
+  context.setLineDash([3, 4]);
+  context.beginPath();
+  const line = Math.round(height - wave.threshold / 40 * strip) + 0.5;
+  context.moveTo(0, line);
+  context.lineTo(width, line);
+  context.stroke();
+  context.setLineDash([]);
+
+  for (const mark of marks) {
+    const x = Math.round((mark.column - start) * width / COLUMNS) + 0.5;
+    context.strokeStyle = mark.tap ? '#fff' : '#5a5a5a';
+    context.beginPath();
+    context.moveTo(x, mark.tap ? 0 : top * 0.3);
+    context.lineTo(x, mark.tap ? top : top * 0.7);
+    context.stroke();
+  }
+}
+
+function drawTargets(now) {
+  const width = window.innerWidth, height = window.innerHeight;
+  const context = fit(el('targets'), width, height);
+  const age = accepted ? now - accepted.at : Infinity;
+  if (age < 500) {
+    const x = accepted.x * width, y = accepted.y * height;
+    context.fillStyle = `rgba(255,255,255,${1 - age / 500})`;
+    context.beginPath();
+    context.arc(x, y, 22, 0, 2 * Math.PI);
+    context.fill();
+    context.strokeStyle = `rgba(255,255,255,${1 - age / 500})`;
+    context.lineWidth = 2;
+    context.beginPath();
+    context.arc(x, y, 22 + 50 * age / 500, 0, 2 * Math.PI);
+    context.stroke();
+  }
+  if (calibration?.phase !== 'taps') return;
+  const x = calibration.x * width, y = calibration.y * height;
+  context.strokeStyle = '#fff';
+  context.lineWidth = 1.5;
+  context.beginPath();
+  context.arc(x, y, 22, 0, 2 * Math.PI);
+  if (calibration.heard) {
+    context.fillStyle = '#fff';
+    context.fill();
+  } else {
+    context.moveTo(x - 7, y);
+    context.lineTo(x + 7, y);
+    context.moveTo(x, y - 7);
+    context.lineTo(x, y + 7);
+  }
+  context.stroke();
+}
+
+function frame(now) {
+  if (calibration) drawTargets(now);
+  else {
+    drawScreen(now);
+    drawCamera(now);
+    drawWave();
+  }
+  requestAnimationFrame(frame);
+}
+
+el('calibrate').onclick = () => post('calibrate');
+el('clear').onclick = () => post('clear');
+el('clicks').onclick = () => post('clicks');
+addEventListener('keydown', event => {
+  if (event.key === 'Escape' && calibration) {
+    event.preventDefault();
+    post('cancel');
+  }
+});
+requestAnimationFrame(frame);
+post('ready');
+</script>
+</body>
+</html>

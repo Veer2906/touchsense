@@ -1,0 +1,77 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+*.xcuserstate
+
+# Playgrounds
+timeline.xctimeline
+playground.xcworkspace
+
+# Swift Package Manager install manifest
+Package.swift.manifest
+
+# fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
+
+# CocoaPods
+Pods/
+
+# Carthage
+Carthage/Build/
+
+# Accio dependency management
+Dependencies/
+.accio/
+
+# Tuist
+*.tuist
+Tuist/Dependencies.swift
+
+# Code Injection
+iOSInjectionProject/
+
+# macOS App build artifacts
+*.app/
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+swiftpm/
+*.swiftinterface
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.swp
+*~
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.*
+!.env.example
